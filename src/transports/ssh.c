@@ -994,7 +994,9 @@ static void load_libssh2(void)
 {
 #ifdef GIT_WIN32
 	/* Windows doesn't do SOVERSIONs but you ship your own library so we're probably OK */
+  printf("loading libssh2\n");
 	git_libssh2_handle = LoadLibrary("libssh2.dll");
+  printf("handle %p\n", git_libssh2_handle);
 #else
 	int i;
 	for (i = 0; !git_libssh2_handle; i++){
