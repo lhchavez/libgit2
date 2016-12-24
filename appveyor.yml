@@ -34,6 +34,7 @@ test_script:
 - ps: |
     $ErrorActionPreference="Stop"
     Start-FileDownload https://github.com/ethomson/poxyproxy/releases/download/v0.1.0/poxyproxy-0.1.0.jar -FileName poxyproxy.jar
+    Start-FileDownload https://dl.bintray.com/libgit2/compiled-binaries/libssh2.dll -FileName Debug/libssh2.dll
     # Run this early so we know it's ready by the time we need it
     $proxyJob = Start-Job { java -jar $Env:APPVEYOR_BUILD_FOLDER\build\poxyproxy.jar -d --port 8080 --credentials foo:bar }
     ctest -V -R libgit2_clar
