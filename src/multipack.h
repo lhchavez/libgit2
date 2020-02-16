@@ -14,6 +14,7 @@
 
 #include "map.h"
 #include "mwindow.h"
+#include "odb.h"
 
 /*
  * A multi-pack-index file.
@@ -49,6 +50,9 @@ typedef struct git_multipack_index_file {
 
 	/* The trailer of the file. Contains the SHA1-checksum of the whole file. */
 	git_oid checksum;
+
+	/* something like ".git/objects/pack/multi-pack-index". */
+	git_buf filename;
 } git_multipack_index_file;
 
 /*
@@ -66,11 +70,18 @@ typedef struct git_multipack_entry {
 int git_multipack_index_open(
 		git_multipack_index_file **idx_out,
 		const char *path);
+bool git_multipack_index_needs_refresh(
+		const git_multipack_index_file *idx,
+		const char *path);
 int git_multipack_index_entry_find(
 		git_multipack_entry *e,
 		git_multipack_index_file *idx,
 		const git_oid *short_oid,
 		size_t len);
+int git_multipack_index_foreach_entry(
+		git_multipack_index_file *idx,
+		git_odb_foreach_cb cb,
+		void *data);
 void git_multipack_index_close(git_multipack_index_file *idx);
 void git_multipack_index_free(git_multipack_index_file *idx);
 
