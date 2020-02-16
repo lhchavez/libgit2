@@ -309,6 +309,10 @@ int git_multipack_index_open(
 	idx = git__calloc(1, sizeof(git_multipack_index_file));
 	GIT_ERROR_CHECK_ALLOC(idx);
 
+	error = git_buf_sets(&idx->filename, path);
+	if (error < 0)
+		return error;
+
 	error = git_futils_mmap_ro(&idx->index_map, fd, 0, idx_size);
 	p_close(fd);
 	if (error < 0) {
@@ -323,6 +327,46 @@ int git_multipack_index_open(
 
 	*idx_out = idx;
 	return 0;
+}
+
+bool git_multipack_index_needs_refresh(
+		const git_multipack_index_file *idx,
+		const char *path)
+{
+	git_file fd = -1;
+	struct stat st;
+	ssize_t bytes_read;
+	git_oid idx_checksum = {{0}};
+
+	/* TODO: properly open the file without access time using O_NOATIME */
+	fd = git_futils_open_ro(path);
+	if (fd < 0)
+		return true;
+
+	if (p_fstat(fd, &st) < 0) {
+		p_close(fd);
+		return true;
+	}
+
+	if (!S_ISREG(st.st_mode) ||
+	    !git__is_sizet(st.st_size) ||
+	    (size_t)st.st_size != idx->index_map.len) {
+		p_close(fd);
+		return true;
+	}
+
+	if (p_lseek(fd, -20, SEEK_END) < 0) {
+		p_close(fd);
+		return true;
+	}
+
+	bytes_read = p_read(fd, &idx_checksum, GIT_OID_RAWSZ);
+	p_close(fd);
+
+	if (bytes_read < 0)
+		return true;
+
+	return git_oid_cmp(&idx_checksum, &idx->checksum) == 0;
 }
 
 int git_multipack_index_entry_find(
@@ -399,6 +443,23 @@ int git_multipack_index_entry_find(
 	return 0;
 }
 
+int git_multipack_index_foreach_entry(
+		git_multipack_index_file *idx,
+		git_odb_foreach_cb cb,
+		void *data)
+{
+	size_t i;
+	int error;
+
+	assert(idx);
+
+	for (i = 0; i < idx->num_objects; ++i)
+		if ((error = cb(&idx->oid_lookup[i], data)) != 0)
+			return git_error_set_after_callback(error);
+
+	return error;
+}
+
 void git_multipack_index_close(git_multipack_index_file *idx)
 {
 	assert(idx);
@@ -413,6 +474,7 @@ void git_multipack_index_free(git_multipack_index_file *idx)
 	if (!idx)
 		return;
 
+	git_buf_dispose(&idx->filename);
 	git_multipack_index_close(idx);
 	git__free(idx);
 }
