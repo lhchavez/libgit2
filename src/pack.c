@@ -1252,6 +1252,62 @@ int git_pack_foreach_entry(
 	return error;
 }
 
+int git_pack_foreach_entry_offset(
+	struct git_pack_file *p,
+	git_pack_foreach_entry_offset_cb cb,
+	void *data)
+{
+	const unsigned char *index = p->index_map.data;
+	off64_t current_offset;
+	const git_oid *current_oid;
+	uint32_t i;
+	int error = 0;
+
+	if (index == NULL) {
+		if ((error = pack_index_open(p)) < 0)
+			return error;
+
+		assert(p->index_map.data);
+
+		index = p->index_map.data;
+	}
+
+	if (p->index_version > 1) {
+		index += 8;
+	}
+
+	index += 4 * 256;
+
+	if (p->index_version > 1) {
+		const unsigned char *offsets = index + 24 * p->num_objects;
+		const unsigned char *large_offset_ptr;
+		const unsigned char *large_offsets = index + 28 * p->num_objects;
+		const unsigned char *large_offsets_end = ((const unsigned char *)p->index_map.data) + p->index_map.len - 20;
+		for (i = 0; i < p->num_objects; i++) {
+			current_offset = ntohl(*(const uint32_t *)(offsets + 4 * i));
+			if (current_offset & 0x80000000) {
+				large_offset_ptr = large_offsets + (current_offset & 0x7fffffff) * 8;
+				if (large_offset_ptr >= large_offsets_end)
+					return -1;
+				current_offset = (((off64_t)ntohl(*((uint32_t *)(large_offset_ptr + 0)))) << 32) |
+						ntohl(*((uint32_t *)(large_offset_ptr + 4)));
+			}
+			current_oid = (const git_oid *)(index + 20 * i);
+			if ((error = cb(current_oid, current_offset, data)) != 0)
+				return git_error_set_after_callback(error);
+		}
+	} else {
+		for (i = 0; i < p->num_objects; i++) {
+			current_offset = ntohl(*(const uint32_t *)(index + 24 * i));
+			current_oid = (const git_oid *)(index + 24 * i + 4);
+			if ((error = cb(current_oid, current_offset, data)) != 0)
+				return git_error_set_after_callback(error);
+		}
+	}
+
+	return 0;
+}
+
 int git_pack__lookup_sha1(const void *oid_lookup_table, size_t stride, unsigned lo,
 		unsigned hi, const unsigned char *oid_prefix)
 {
