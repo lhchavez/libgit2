@@ -28,6 +28,7 @@ jobs:
         container:
         - xenial
         - bionic
+        - focal
         - docurium
     runs-on: ubuntu-latest
     steps:
@@ -84,6 +85,20 @@ jobs:
           env:
             CC: clang
             CMAKE_OPTIONS: -DUSE_HTTPS=mbedTLS -DUSE_SHA1=HTTPS -DREGEX_BACKEND=pcre -DDEPRECATE_HARD=ON -DUSE_LEAK_CHECKER=valgrind -DUSE_GSSAPI=ON
+            CMAKE_GENERATOR: Ninja
+          os: ubuntu-latest
+        - # Focal, Clang 10, OpenSSL, MemorySanitizer
+          image: focal
+          env:
+            CC: clang-10
+            CMAKE_OPTIONS: -DUSE_HTTPS=OpenSSL -DUSE_SHA1=HTTPS -DREGEX_BACKEND=pcre  -DDEPRECATE_HARD=ON -DUSE_BUNDLED_ZLIB=ON "-DCMAKE_C_FLAGS=-fsanitize=memory -fno-optimize-sibling-calls -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -g"
+            CMAKE_GENERATOR: Ninja
+          os: ubuntu-latest
+        - # Focal, Clang 10, OpenSSL, UndefinedBehaviorSanitizer
+          image: focal
+          env:
+            CC: clang-10
+            CMAKE_OPTIONS: -DUSE_HTTPS=OpenSSL -DUSE_SHA1=HTTPS -DREGEX_BACKEND=pcre  -DDEPRECATE_HARD=ON -DUSE_BUNDLED_ZLIB=ON "-DCMAKE_C_FLAGS=-fsanitize=undefined,nullability -fsanitize-blacklist=../scripts/sanitizers.supp -g"
             CMAKE_GENERATOR: Ninja
           os: ubuntu-latest
         - # macOS
