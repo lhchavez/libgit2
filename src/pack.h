@@ -151,8 +151,10 @@ int get_delta_base(
 		git_object_t type,
 		off64_t delta_obj_offset);
 
-void git_packfile_close(struct git_pack_file *p, bool unlink_packfile);
-void git_packfile_free(struct git_pack_file *p);
+/* Run with the mwindow lock held */
+void git_packfile_close_locked(struct git_pack_file *p, bool unlink_packfile);
+/* Run with the mwindow lock held */
+void git_packfile_free_locked(struct git_pack_file *p);
 int git_packfile_alloc(struct git_pack_file **pack_out, const char *path);
 
 int git_pack_entry_find(

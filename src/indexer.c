@@ -1325,9 +1325,9 @@ void git_indexer_free(git_indexer *idx)
 
 	if (!git_mutex_lock(&git__mwindow_mutex)) {
 		if (!idx->pack_committed)
-			git_packfile_close(idx->pack, true);
+			git_packfile_close_locked(idx->pack, true);
 
-		git_packfile_free(idx->pack);
+		git_packfile_free_locked(idx->pack);
 		git_mutex_unlock(&git__mwindow_mutex);
 	}
 

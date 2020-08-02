@@ -16,8 +16,8 @@
 /* Option to bypass checking existence of '.keep' files */
 bool git_disable_pack_keep_file_checks = false;
 
-static int packfile_open(struct git_pack_file *p);
-static off64_t nth_packed_object_offset(const struct git_pack_file *p, uint32_t n);
+static int packfile_open_locked(struct git_pack_file *p);
+static off64_t nth_packed_object_offset(struct git_pack_file *p, uint32_t n);
 static int packfile_unpack_compressed(
 		git_rawobj *obj,
 		struct git_pack_file *p,
@@ -196,7 +196,8 @@ static void pack_index_free(struct git_pack_file *p)
 	}
 }
 
-static int pack_index_check(const char *path, struct git_pack_file *p)
+/* Run with the packfile lock held */
+static int pack_index_check_locked(const char *path, struct git_pack_file *p)
 {
 	struct git_pack_idx_header *hdr;
 	uint32_t version, nr, i, *index;
@@ -302,39 +303,36 @@ static int pack_index_check(const char *path, struct git_pack_file *p)
 	return 0;
 }
 
-static int pack_index_open(struct git_pack_file *p)
+/* Run with the pack file lock held */
+static int pack_index_open_locked(struct git_pack_file *p)
 {
 	int error = 0;
 	size_t name_len;
-	git_buf idx_name;
+	git_buf idx_name = GIT_BUF_INIT;
 
 	if (p->index_version > -1)
-		return 0;
+		goto cleanup;
 
 	name_len = strlen(p->pack_name);
 	assert(name_len > strlen(".pack")); /* checked by git_pack_file alloc */
 
-	if (git_buf_init(&idx_name, name_len) < 0)
-		return -1;
+	if ((error = git_buf_init(&idx_name, name_len)) < 0)
+		goto cleanup;
 
 	git_buf_put(&idx_name, p->pack_name, name_len - strlen(".pack"));
 	git_buf_puts(&idx_name, ".idx");
 	if (git_buf_oom(&idx_name)) {
-		git_buf_dispose(&idx_name);
-		return -1;
+		error = -1;
+		goto cleanup;
 	}
 
-	if ((error = git_mutex_lock(&p->lock)) < 0) {
-		git_buf_dispose(&idx_name);
-		return error;
-	}
+	if (p->index_version == -1 && (error = pack_index_check_locked(idx_name.ptr, p)) < 0)
+		goto cleanup;
 
-	if (p->index_version == -1)
-		error = pack_index_check(idx_name.ptr, p);
+	assert(p->index_map.data);
 
+cleanup:
 	git_buf_dispose(&idx_name);
-
-	git_mutex_unlock(&p->lock);
 
 	return error;
 }
@@ -345,8 +343,15 @@ static unsigned char *pack_window_open(
 		off64_t offset,
 		unsigned int *left)
 {
-	if (p->mwf.fd == -1 && packfile_open(p) < 0)
+	unsigned char *pack_data = NULL;
+
+	if (git_mutex_lock(&p->lock) < 0) {
+		git_error_set(GIT_ERROR_THREAD, "unable to lock packfile");
 		return NULL;
+	}
+
+	if (p->mwf.fd == -1 && packfile_open_locked(p) < 0)
+		goto cleanup;
 
 	/* Since packfiles end in a hash of their content and it's
 	 * pointless to ask for an offset into the middle of that
@@ -357,11 +362,15 @@ static unsigned char *pack_window_open(
 	 * around.
 	 */
 	if (offset > (p->mwf.size - 20))
-		return NULL;
+		goto cleanup;
 	if (offset < 0)
-		return NULL;
+		goto cleanup;
 
-	return git_mwindow_open(&p->mwf, w_cursor, offset, 20, left);
+	pack_data = git_mwindow_open(&p->mwf, w_cursor, offset, 20, left);
+
+cleanup:
+	git_mutex_unlock(&p->lock);
+	return pack_data;
  }
 
 /*
@@ -480,7 +489,11 @@ int git_packfile_resolve_header(
 	off64_t base_offset;
 	int error;
 
+	error = git_mutex_lock(&p->lock);
+	if (error < 0)
+		return error;
 	error = git_packfile_unpack_header(&size, &type, &p->mwf, &w_curs, &curpos);
+	git_mutex_unlock(&p->lock);
 	if (error < 0)
 		return error;
 
@@ -507,7 +520,11 @@ int git_packfile_resolve_header(
 
 	while (type == GIT_OBJECT_OFS_DELTA || type == GIT_OBJECT_REF_DELTA) {
 		curpos = base_offset;
+		error = git_mutex_lock(&p->lock);
+		if (error < 0)
+			return error;
 		error = git_packfile_unpack_header(&size, &type, &p->mwf, &w_curs, &curpos);
+		git_mutex_unlock(&p->lock);
 		if (error < 0)
 			return error;
 		if (type != GIT_OBJECT_OFS_DELTA && type != GIT_OBJECT_REF_DELTA)
@@ -578,8 +595,11 @@ static int pack_dependency_chain(git_dependency_chain *chain_out,
 
 		elem->base_key = obj_offset;
 
+		error = git_mutex_lock(&p->lock);
+		if (error < 0)
+			return error;
 		error = git_packfile_unpack_header(&size, &type, &p->mwf, &w_curs, &curpos);
-
+		git_mutex_unlock(&p->lock);
 		if (error < 0)
 			goto on_error;
 
@@ -965,26 +985,35 @@ int get_delta_base(
  *
  ***********************************************************/
 
-void git_packfile_close(struct git_pack_file *p, bool unlink_packfile)
+/* Run with the mwindow lock held */
+void git_packfile_close_locked(struct git_pack_file *p, bool unlink_packfile)
 {
+	bool locked = true;
+	if (git_mutex_lock(&p->lock) < 0) {
+		git_error_set(GIT_ERROR_OS, "failed to lock pack file");
+		locked = false;
+	}
 	if (p->mwf.fd >= 0) {
 		git_mwindow_free_all_locked(&p->mwf);
 		p_close(p->mwf.fd);
 		p->mwf.fd = -1;
 	}
+	if (locked)
+		git_mutex_unlock(&p->lock);
 
 	if (unlink_packfile)
 		p_unlink(p->pack_name);
 }
 
-void git_packfile_free(struct git_pack_file *p)
+/* Run with the mwindow lock held */
+void git_packfile_free_locked(struct git_pack_file *p)
 {
 	if (!p)
 		return;
 
 	cache_free(&p->bases);
 
-	git_packfile_close(p, false);
+	git_packfile_close_locked(p, false);
 
 	pack_index_free(p);
 
@@ -995,24 +1024,18 @@ void git_packfile_free(struct git_pack_file *p)
 	git__free(p);
 }
 
-static int packfile_open(struct git_pack_file *p)
+static int packfile_open_locked(struct git_pack_file *p)
 {
 	struct stat st;
 	struct git_pack_header hdr;
 	git_oid sha1;
 	unsigned char *idx_sha1;
 
-	if (p->index_version == -1 && pack_index_open(p) < 0)
+	if (pack_index_open_locked(p) < 0)
 		return git_odb__error_notfound("failed to open packfile", NULL, 0);
 
-	/* if mwf opened by another thread, return now */
-	if (git_mutex_lock(&p->lock) < 0)
-		return packfile_error("failed to get lock for open");
-
-	if (p->mwf.fd >= 0) {
-		git_mutex_unlock(&p->lock);
+	if (p->mwf.fd >= 0)
 		return 0;
-	}
 
 	/* TODO: open with noatime */
 	p->mwf.fd = git_futils_open_ro(p->pack_name);
@@ -1061,7 +1084,6 @@ static int packfile_open(struct git_pack_file *p)
 	if (git_oid__cmp(&sha1, (git_oid *)idx_sha1) != 0)
 		goto cleanup;
 
-	git_mutex_unlock(&p->lock);
 	return 0;
 
 cleanup:
@@ -1070,8 +1092,6 @@ cleanup:
 	if (p->mwf.fd >= 0)
 		p_close(p->mwf.fd);
 	p->mwf.fd = -1;
-
-	git_mutex_unlock(&p->lock);
 
 	return -1;
 }
@@ -1164,28 +1184,42 @@ int git_packfile_alloc(struct git_pack_file **pack_out, const char *path)
  *
  ***********************************************************/
 
-static off64_t nth_packed_object_offset(const struct git_pack_file *p, uint32_t n)
+static off64_t nth_packed_object_offset(struct git_pack_file *p, uint32_t n)
 {
-	const unsigned char *index = p->index_map.data;
-	const unsigned char *end = index + p->index_map.len;
+	const unsigned char *index, *end;
+	int error;
+	uint32_t off32;
+	off64_t off;
+
+	if ((error = git_mutex_lock(&p->lock)) < 0)
+		return error;
+
+	index = p->index_map.data;
+	end = index + p->index_map.len;
 	index += 4 * 256;
 	if (p->index_version == 1) {
+		git_mutex_unlock(&p->lock);
 		return ntohl(*((uint32_t *)(index + 24 * n)));
-	} else {
-		uint32_t off;
-		index += 8 + p->num_objects * (20 + 4);
-		off = ntohl(*((uint32_t *)(index + 4 * n)));
-		if (!(off & 0x80000000))
-			return off;
-		index += p->num_objects * 4 + (off & 0x7fffffff) * 8;
-
-		/* Make sure we're not being sent out of bounds */
-		if (index >= end - 8)
-			return -1;
-
-		return (((uint64_t)ntohl(*((uint32_t *)(index + 0)))) << 32) |
-					ntohl(*((uint32_t *)(index + 4)));
 	}
+
+	index += 8 + p->num_objects * (20 + 4);
+	off32 = ntohl(*((uint32_t *)(index + 4 * n)));
+	if (!(off32 & 0x80000000)) {
+		git_mutex_unlock(&p->lock);
+		return off32;
+	}
+	index += p->num_objects * 4 + (off32 & 0x7fffffff) * 8;
+
+	/* Make sure we're not being sent out of bounds */
+	if (index >= end - 8) {
+		git_mutex_unlock(&p->lock);
+		return -1;
+	}
+
+	off = (((uint64_t)ntohl(*((uint32_t *)(index + 0)))) << 32) |
+				ntohl(*((uint32_t *)(index + 4)));
+	git_mutex_unlock(&p->lock);
+	return off;
 }
 
 static int git__memcmp4(const void *a, const void *b) {
@@ -1197,18 +1231,19 @@ int git_pack_foreach_entry(
 	git_odb_foreach_cb cb,
 	void *data)
 {
-	const unsigned char *index = p->index_map.data, *current;
+	const unsigned char *index, *current;
 	uint32_t i;
 	int error = 0;
 
-	if (index == NULL) {
-		if ((error = pack_index_open(p)) < 0)
-			return error;
+	if ((error = git_mutex_lock(&p->lock)) < 0)
+		return error;
 
-		assert(p->index_map.data);
-
-		index = p->index_map.data;
+	if ((error = pack_index_open_locked(p)) < 0) {
+		git_mutex_unlock(&p->lock);
+		return error;
 	}
+
+	index = p->index_map.data;
 
 	if (p->index_version > 1) {
 		index += 8;
@@ -1219,11 +1254,15 @@ int git_pack_foreach_entry(
 	if (p->oids == NULL) {
 		git_vector offsets, oids;
 
-		if ((error = git_vector_init(&oids, p->num_objects, NULL)))
+		if ((error = git_vector_init(&oids, p->num_objects, NULL))) {
+			git_mutex_unlock(&p->lock);
 			return error;
+		}
 
-		if ((error = git_vector_init(&offsets, p->num_objects, git__memcmp4)))
+		if ((error = git_vector_init(&offsets, p->num_objects, git__memcmp4))) {
+			git_mutex_unlock(&p->lock);
 			return error;
+		}
 
 		if (p->index_version > 1) {
 			const unsigned char *off = index + 24 * p->num_objects;
@@ -1243,6 +1282,7 @@ int git_pack_foreach_entry(
 		git_vector_free(&offsets);
 		p->oids = (git_oid **)git_vector_detach(NULL, NULL, &oids);
 	}
+	git_mutex_unlock(&p->lock);
 
 	for (i = 0; i < p->num_objects; i++)
 		if ((error = cb(p->oids[i], data)) != 0)
@@ -1285,19 +1325,21 @@ static int pack_entry_find_offset(
 	int pos, found = 0;
 	off64_t offset;
 	const unsigned char *current = 0;
+	int error;
 
 	*offset_out = 0;
 
-	if (p->index_version == -1) {
-		int error;
+	if ((error = git_mutex_lock(&p->lock)) < 0)
+		return error;
 
-		if ((error = pack_index_open(p)) < 0)
-			return error;
-		assert(p->index_map.data);
+	if ((error = pack_index_open_locked(p)) < 0) {
+		git_mutex_unlock(&p->lock);
+		return error;
 	}
 
 	index = p->index_map.data;
 	level1_ofs = p->index_map.data;
+	git_mutex_unlock(&p->lock);
 
 	if (p->index_version > 1) {
 		level1_ofs += 2;
@@ -1395,11 +1437,19 @@ int git_pack_entry_find(
 	if (error < 0)
 		return error;
 
+	/* if mwf opened by another thread, return now */
+	error = git_mutex_lock(&p->lock);
+	if (error < 0)
+		return error;
+
 	/* we found a unique entry in the index;
 	 * make sure the packfile backing the index
 	 * still exists on disk */
-	if (p->mwf.fd == -1 && (error = packfile_open(p)) < 0)
+	if (p->mwf.fd == -1 && (error = packfile_open_locked(p)) < 0) {
+		git_mutex_unlock(&p->lock);
 		return error;
+	}
+	git_mutex_unlock(&p->lock);
 
 	e->offset = offset;
 	e->p = p;

@@ -84,12 +84,12 @@ int git_mwindow_get_pack(struct git_pack_file **out, const char *path)
 	git_atomic_inc(&pack->refcount);
 
 	error = git_strmap_set(git__pack_cache, pack->pack_name, pack);
-	git_mutex_unlock(&git__mwindow_mutex);
-
 	if (error < 0) {
-		git_packfile_free(pack);
+		git_packfile_free_locked(pack);
+		git_mutex_unlock(&git__mwindow_mutex);
 		return -1;
 	}
+	git_mutex_unlock(&git__mwindow_mutex);
 
 	*out = pack;
 	return 0;
@@ -111,7 +111,7 @@ void git_mwindow_put_pack(struct git_pack_file *pack)
 	count = git_atomic_dec(&pack->refcount);
 	if (count == 0) {
 		git_strmap_delete(git__pack_cache, pack->pack_name);
-		git_packfile_free(pack);
+		git_packfile_free_locked(pack);
 	}
 
 	git_mutex_unlock(&git__mwindow_mutex);
