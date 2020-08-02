@@ -279,7 +279,7 @@ static int git_mwindow_close_lru_window(void)
  *
  * Called under lock from new_window.
  */
-static int git_mwindow_close_lru_file(void)
+static int git_mwindow_close_lru_file(git_vector *closed_files)
 {
 	git_mwindow_ctl *ctl = &git_mwindow__mem_ctl;
 	git_mwindow_file *lru_file = NULL, *current_file = NULL;
@@ -302,10 +302,7 @@ static int git_mwindow_close_lru_file(void)
 	}
 
 	git_mwindow_free_all_locked(lru_file);
-	p_close(lru_file->fd);
-	lru_file->fd = -1;
-
-	return 0;
+	return git_vector_insert(closed_files, lru_file);
 }
 
 /* This gets called under lock from git_mwindow_open */
@@ -319,12 +316,11 @@ static git_mwindow *new_window(
 	off64_t len;
 	git_mwindow *w;
 
-	w = git__malloc(sizeof(*w));
+	w = git__calloc(1, sizeof(*w));
 
 	if (w == NULL)
 		return NULL;
 
-	memset(w, 0x0, sizeof(*w));
 	w->offset = (offset / walign) * walign;
 
 	len = size - w->offset;
@@ -432,8 +428,11 @@ unsigned char *git_mwindow_open(
 
 int git_mwindow_file_register(git_mwindow_file *mwf)
 {
+	git_vector closed_files = GIT_VECTOR_INIT;
 	git_mwindow_ctl *ctl = &git_mwindow__mem_ctl;
-	int ret;
+	int error;
+	size_t i;
+	git_mwindow_file *closed_file = NULL;
 
 	if (git_mutex_lock(&git__mwindow_mutex)) {
 		git_error_set(GIT_ERROR_THREAD, "unable to lock mwindow mutex");
@@ -448,13 +447,25 @@ int git_mwindow_file_register(git_mwindow_file *mwf)
 
 	if (git_mwindow__file_limit) {
 		while (git_mwindow__file_limit <= ctl->windowfiles.length &&
-				git_mwindow_close_lru_file() == 0) /* nop */;
+				git_mwindow_close_lru_file(&closed_files) == 0) /* nop */;
 	}
 
-	ret = git_vector_insert(&ctl->windowfiles, mwf);
+	error = git_vector_insert(&ctl->windowfiles, mwf);
 	git_mutex_unlock(&git__mwindow_mutex);
+	if (error < 0)
+		return error;
 
-	return ret;
+	git_vector_foreach(&closed_files, i, closed_file) {
+		error = git_mutex_lock(&closed_file->lock);
+		if (error < 0)
+			continue;
+		p_close(closed_file->fd);
+		closed_file->fd = -1;
+		git_mutex_unlock(&closed_file->lock);
+	}
+	git_vector_free(&closed_files);
+
+	return error;
 }
 
 void git_mwindow_file_deregister(git_mwindow_file *mwf)

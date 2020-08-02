@@ -180,8 +180,10 @@ int git_indexer_new(
 		goto cleanup;
 
 	idx->pack->mwf.fd = fd;
-	if ((error = git_mwindow_file_register(&idx->pack->mwf)) < 0)
+	if ((error = git_mwindow_file_register(&idx->pack->mwf)) < 0) {
+		git_mutex_free(&idx->pack->mwf.lock);
 		goto cleanup;
+	}
 
 	*out = idx;
 	return 0;
@@ -677,7 +679,7 @@ static int read_stream_object(git_indexer *idx, git_indexer_progress *stats)
 		return GIT_EBUFS;
 
 	if (!idx->have_stream) {
-		error = git_packfile_unpack_header(&entry_size, &type, &idx->pack->mwf, &w, &idx->off);
+		error = git_packfile_unpack_header(&entry_size, &type, idx->pack, &w, &idx->off);
 		if (error == GIT_EBUFS) {
 			idx->off = entry_start;
 			return error;
@@ -963,7 +965,7 @@ static int fix_thin_pack(git_indexer *idx, git_indexer_progress *stats)
 			continue;
 
 		curpos = delta->delta_off;
-		error = git_packfile_unpack_header(&size, &type, &idx->pack->mwf, &w, &curpos);
+		error = git_packfile_unpack_header(&size, &type, idx->pack, &w, &curpos);
 		if (error < 0)
 			return error;
 

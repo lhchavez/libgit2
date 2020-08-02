@@ -22,6 +22,7 @@ typedef struct git_mwindow {
 } git_mwindow;
 
 typedef struct git_mwindow_file {
+	git_mutex lock; /* protects updates to fd */
 	git_mwindow *windows;
 	int fd;
 	off64_t size;

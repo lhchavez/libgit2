@@ -349,6 +349,11 @@ static unsigned char *pack_window_open(
 		git_error_set(GIT_ERROR_THREAD, "unable to lock packfile");
 		return NULL;
 	}
+	if (git_mutex_lock(&p->mwf.lock) < 0) {
+		git_mutex_unlock(&p->lock);
+		git_error_set(GIT_ERROR_THREAD, "unable to lock packfile");
+		return NULL;
+	}
 
 	if (p->mwf.fd == -1 && packfile_open_locked(p) < 0)
 		goto cleanup;
@@ -369,6 +374,7 @@ static unsigned char *pack_window_open(
 	pack_data = git_mwindow_open(&p->mwf, w_cursor, offset, 20, left);
 
 cleanup:
+	git_mutex_unlock(&p->mwf.lock);
 	git_mutex_unlock(&p->lock);
 	return pack_data;
  }
@@ -445,14 +451,29 @@ static int packfile_unpack_header1(
 int git_packfile_unpack_header(
 		size_t *size_p,
 		git_object_t *type_p,
-		git_mwindow_file *mwf,
+		struct git_pack_file *p,
 		git_mwindow **w_curs,
 		off64_t *curpos)
 {
 	unsigned char *base;
 	unsigned int left;
 	unsigned long used;
-	int ret;
+	int error;
+
+	error = git_mutex_lock(&p->lock);
+	if (error < 0)
+		return error;
+	error = git_mutex_lock(&p->mwf.lock);
+	if (error < 0) {
+		git_mutex_unlock(&p->lock);
+		return error;
+	}
+
+	if (p->mwf.fd == -1 && (error = packfile_open_locked(p)) < 0) {
+		git_mutex_unlock(&p->lock);
+		git_mutex_unlock(&p->mwf.lock);
+		return error;
+	}
 
 	/* pack_window_open() assures us we have [base, base + 20) available
 	 * as a range that we can look at at. (Its actually the hash
@@ -460,16 +481,17 @@ int git_packfile_unpack_header(
 	 * the maximum deflated object size is 2^137, which is just
 	 * insane, so we know won't exceed what we have been given.
 	 */
-/*	base = pack_window_open(p, w_curs, *curpos, &left); */
-	base = git_mwindow_open(mwf, w_curs, *curpos, 20, &left);
+	base = git_mwindow_open(&p->mwf, w_curs, *curpos, 20, &left);
+	git_mutex_unlock(&p->lock);
+	git_mutex_unlock(&p->mwf.lock);
 	if (base == NULL)
 		return GIT_EBUFS;
 
-	ret = packfile_unpack_header1(&used, size_p, type_p, base, left);
+	error = packfile_unpack_header1(&used, size_p, type_p, base, left);
 	git_mwindow_close(w_curs);
-	if (ret == GIT_EBUFS)
-		return ret;
-	else if (ret < 0)
+	if (error == GIT_EBUFS)
+		return error;
+	else if (error < 0)
 		return packfile_error("header length is zero");
 
 	*curpos += used;
@@ -489,11 +511,7 @@ int git_packfile_resolve_header(
 	off64_t base_offset;
 	int error;
 
-	error = git_mutex_lock(&p->lock);
-	if (error < 0)
-		return error;
-	error = git_packfile_unpack_header(&size, &type, &p->mwf, &w_curs, &curpos);
-	git_mutex_unlock(&p->lock);
+	error = git_packfile_unpack_header(&size, &type, p, &w_curs, &curpos);
 	if (error < 0)
 		return error;
 
@@ -520,11 +538,7 @@ int git_packfile_resolve_header(
 
 	while (type == GIT_OBJECT_OFS_DELTA || type == GIT_OBJECT_REF_DELTA) {
 		curpos = base_offset;
-		error = git_mutex_lock(&p->lock);
-		if (error < 0)
-			return error;
-		error = git_packfile_unpack_header(&size, &type, &p->mwf, &w_curs, &curpos);
-		git_mutex_unlock(&p->lock);
+		error = git_packfile_unpack_header(&size, &type, p, &w_curs, &curpos);
 		if (error < 0)
 			return error;
 		if (type != GIT_OBJECT_OFS_DELTA && type != GIT_OBJECT_REF_DELTA)
@@ -595,11 +609,7 @@ static int pack_dependency_chain(git_dependency_chain *chain_out,
 
 		elem->base_key = obj_offset;
 
-		error = git_mutex_lock(&p->lock);
-		if (error < 0)
-			return error;
-		error = git_packfile_unpack_header(&size, &type, &p->mwf, &w_curs, &curpos);
-		git_mutex_unlock(&p->lock);
+		error = git_packfile_unpack_header(&size, &type, p, &w_curs, &curpos);
 		if (error < 0)
 			goto on_error;
 
@@ -993,13 +1003,20 @@ void git_packfile_close_locked(struct git_pack_file *p, bool unlink_packfile)
 		git_error_set(GIT_ERROR_OS, "failed to lock pack file");
 		locked = false;
 	}
+	if (locked && git_mutex_lock(&p->mwf.lock) < 0) {
+		git_error_set(GIT_ERROR_OS, "unable to lock packfile");
+		git_mutex_unlock(&p->lock);
+		locked = false;
+	}
 	if (p->mwf.fd >= 0) {
 		git_mwindow_free_all_locked(&p->mwf);
 		p_close(p->mwf.fd);
 		p->mwf.fd = -1;
 	}
-	if (locked)
+	if (locked) {
+		git_mutex_unlock(&p->mwf.lock);
 		git_mutex_unlock(&p->lock);
+	}
 
 	if (unlink_packfile)
 		p_unlink(p->pack_name);
@@ -1019,8 +1036,9 @@ void git_packfile_free_locked(struct git_pack_file *p)
 
 	git__free(p->bad_object_sha1);
 
-	git_mutex_free(&p->lock);
 	git_mutex_free(&p->bases.lock);
+	git_mutex_free(&p->mwf.lock);
+	git_mutex_free(&p->lock);
 	git__free(p);
 }
 
@@ -1042,8 +1060,10 @@ static int packfile_open_locked(struct git_pack_file *p)
 	if (p->mwf.fd < 0)
 		goto cleanup;
 
-	if (p_fstat(p->mwf.fd, &st) < 0 ||
-		git_mwindow_file_register(&p->mwf) < 0)
+	if (p_fstat(p->mwf.fd, &st) < 0)
+		goto cleanup;
+
+	if (git_mwindow_file_register(&p->mwf) < 0)
 		goto cleanup;
 
 	/* If we created the struct before we had the pack we lack size. */
@@ -1162,13 +1182,22 @@ int git_packfile_alloc(struct git_pack_file **pack_out, const char *path)
 	p->mtime = (git_time_t)st.st_mtime;
 	p->index_version = -1;
 
-	if (git_mutex_init(&p->lock)) {
+	if (git_mutex_init(&p->lock) < 0) {
 		git_error_set(GIT_ERROR_OS, "failed to initialize packfile mutex");
 		git__free(p);
 		return -1;
 	}
 
+	if (git_mutex_init(&p->mwf.lock) < 0) {
+		git_error_set(GIT_ERROR_OS, "failed to initialize packfile window mutex");
+		git_mutex_free(&p->lock);
+		git__free(p);
+		return -1;
+	}
+
 	if (cache_init(&p->bases) < 0) {
+		git_mutex_free(&p->mwf.lock);
+		git_mutex_free(&p->lock);
 		git__free(p);
 		return -1;
 	}
@@ -1441,14 +1470,21 @@ int git_pack_entry_find(
 	error = git_mutex_lock(&p->lock);
 	if (error < 0)
 		return error;
+	error = git_mutex_lock(&p->mwf.lock);
+	if (error < 0) {
+		git_mutex_unlock(&p->lock);
+		return error;
+	}
 
 	/* we found a unique entry in the index;
 	 * make sure the packfile backing the index
 	 * still exists on disk */
 	if (p->mwf.fd == -1 && (error = packfile_open_locked(p)) < 0) {
+		git_mutex_unlock(&p->mwf.lock);
 		git_mutex_unlock(&p->lock);
 		return error;
 	}
+	git_mutex_unlock(&p->mwf.lock);
 	git_mutex_unlock(&p->lock);
 
 	e->offset = offset;

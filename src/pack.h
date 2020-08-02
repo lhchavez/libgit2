@@ -85,7 +85,7 @@ typedef struct {
 struct git_pack_file {
 	git_mwindow_file mwf;
 	git_map index_map;
-	git_mutex lock; /* protect updates to mwf and index_map */
+	git_mutex lock; /* protect updates to index_map */
 	git_atomic refcount;
 
 	uint32_t num_objects;
@@ -127,7 +127,7 @@ int git_packfile__name(char **out, const char *path);
 int git_packfile_unpack_header(
 		size_t *size_p,
 		git_object_t *type_p,
-		git_mwindow_file *mwf,
+		struct git_pack_file *p,
 		git_mwindow **w_curs,
 		off64_t *curpos);
 

@@ -68,6 +68,8 @@ int p_munmap(git_map *map)
 {
 	assert(map != NULL);
 	munmap(map->data, map->len);
+	map->data = NULL;
+	map->len = 0;
 
 	return 0;
 }
