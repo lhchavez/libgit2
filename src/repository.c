@@ -1100,7 +1100,8 @@ int git_repository_odb__weakptr(git_odb **out, git_repository *repo)
 
 	assert(repo && out);
 
-	if (repo->_odb == NULL) {
+	*out = git__load(repo->_odb);
+	if (*out == NULL) {
 		git_buf odb_path = GIT_BUF_INIT;
 		git_odb *odb;
 
@@ -1124,9 +1125,9 @@ int git_repository_odb__weakptr(git_odb **out, git_repository *repo)
 		}
 
 		git_buf_dispose(&odb_path);
+		*out = git__load(repo->_odb);
 	}
 
-	*out = repo->_odb;
 	return error;
 }
 
