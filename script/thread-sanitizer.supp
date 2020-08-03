@@ -1,0 +1,9 @@
+# In attr_file_free, the locks are acquired in the opposite order in which they
+# are normally acquired. This is probably something worth fixing to have a
+# consistent lock hierarchy that is easy to understand.
+deadlock:attr_cache_lock
+
+# When invoking the time/timezone functions from git_signature_now(), they
+# access libc methods that need to be instrumented to correctly analyze the
+# data races.
+called_from_lib:libc.so.6
